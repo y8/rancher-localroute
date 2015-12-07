@@ -1,0 +1,261 @@
+#!/usr/bin/ruby
+
+require 'socket'
+require 'optparse'
+
+# We need IP forwarding and local routing to make this work
+SYSCTL_KEYS = {
+  'net.ipv4.ip_forward' => '1',
+  'net.ipv4.conf.all.route_localnet' => '1'
+}.freeze
+
+# We can ignore rancher IPSec. Strings to avoid type casting
+INGORE_PORTS = ['500', '4500']
+
+CATTLE_CHAIN = 'CATTLE_PREROUTING'
+CATTLE_CHAIN_COMMAND = "iptables -t nat -S #{CATTLE_CHAIN}"
+
+POLLER_OUTPUT_CHAIN = 'POLLER_OUTPUT'
+POLLER_POSTROUTING_CHAIN = 'POLLER_POSTROUTING'
+
+POLLER_OUTPUT = "-d 127.0.0.1 -p %{proto} --dport %{source_port} -j DNAT --to %{dest_address}:%{dest_port}"
+POLLER_POSTROUTING = "-d %{dest_address} -p %{proto} --dport %{dest_port} -j SNAT --to-source %{host_ip}"
+
+# Exception to be raised when system call failed.
+class ExecFailed < RuntimeError
+  attr_reader :command, :exit_code, :output
+
+  def initialize(command, exit_code, output)
+    @command = command.chomp
+    @exit_code = exit_code
+    @output = output
+  end
+
+  def inspect
+    "ExecFailed: command `#{command}`, failed with #{exit_code}, output:\n #{output}"
+  end
+  alias_method :to_s, :inspect
+end
+
+# Instead of regexp, lets try with optparse
+module IPTables
+  class DNAT
+    Rule = Struct.new(:proto, :source_port, :dest_address, :dest_port, :host_ip) do
+      # <# tcp://500 -> 10.0.1.1:466>
+      def to_s
+        "<#{proto}: #{host_ip}:#{source_port} -> #{dest_address}:#{dest_port}>"
+      end
+    end
+
+    def self.parse(options, host_ip)
+      rule = Rule.new
+      rule.host_ip = host_ip
+
+      opt_parser = OptionParser.new do |opts|
+        opts.on('-A ADD_CHAIN')
+        opts.on('-p PROTO') do |proto|
+          rule.proto = proto
+        end
+        opts.on('-m MARK_TYPE')
+        opts.on('--dst-type TYPE')
+        opts.on('--dport PORT') do |source_port|
+          rule.source_port = source_port
+        end
+        opts.on('-j JUMP_CHAIN')
+        opts.on('--to-destination ADDR') do |dest|
+          rule.dest_address, rule.dest_port = dest.split(":")
+        end
+      end
+
+      opt_parser.parse!(options.split)
+
+      return rule
+    end
+  end
+end
+
+def log(message)
+  puts "[#{Time.now}] #{message}"
+end
+
+def debug(message)
+  puts "DEBUG [#{Time.now}] #{message}" if ENV['DEBUG']
+end
+
+def exec_safely(command)
+  output = `#{command} 2>&1`
+  exit_status = $?.exitstatus
+
+  if exit_status != 0
+    raise ExecFailed.new(command, exit_status, output)
+  else
+    return output
+  end
+end
+
+def get_host_ip
+  return @host_ip if defined? @host_ip
+
+  # Drop the loopback ips
+  all_addresses =  Socket.ip_address_list.reject {|a| a.ipv4_loopback? || a.ipv6_loopback? }
+
+  # Try to find the ip4 address
+  ipv4s = all_addresses.find_all(&:ipv4?).map(&:ip_address)
+  ipv6s = all_addresses.find_all(&:ipv6?).map(&:ip_address)
+
+  host_address = ipv4s.shift
+
+  # Technically, we have more chances with IPv6 when available, but don't have
+  # time to implement v6 look up;)
+
+  if host_address
+    log "\tDone. Using #{host_address} as return address (other options: #{ipv4s.join(', ')})"
+
+    @host_ip = host_address
+  else
+    log "Can't detect host address. Set 'HOST_IP' to explicitly set IP."
+    exit 3
+  end
+end
+
+# Check that we can access CATTLE_PREROUTING chain
+def check_cattle
+  log "Checking #{CATTLE_CHAIN} iptables chain..."
+
+  raw_cattle_prerouting
+
+  log "\tDone. Cattle is available"
+end
+
+def check_sysctl
+  log 'Checking host configuration...'
+
+  SYSCTL_KEYS.each do |key, value|
+    result = exec_safely("sysctl -n #{key}").chomp
+    next if result == value
+
+    log "\t#{key} is not '#{value}'. Please set this key in /etc/sysctl.conf"
+    log "\tor in /etc/sysctl.d/<xx>-<name>.conf and reboot the host."
+
+    log "\tOther required keys: #{SYSCTL_KEYS.keys.join(', ')}"
+
+    exit 1
+  end
+
+  log "\tDone. All keys are set"
+end
+
+def raw_cattle_prerouting
+
+  exec_safely CATTLE_CHAIN_COMMAND
+
+rescue ExecFailed => failure
+  log "Can't access CATTLE_PREROUTING iptables chain."
+  log "\tEnsure that container started with --privileged and try again."
+  log "\tTried with #{failure.command}, exit code #{failure.exit_code}, log:"
+
+  puts failure.output
+
+  exit 1
+end
+
+def cattle_prerouting
+  lines = raw_cattle_prerouting.split("\n")
+  chain_name = lines.shift.split.last
+
+  # It will fail on unknown options, but let it fail.
+  rules = lines.map do |rule|
+    IPTables::DNAT.parse(rule, get_host_ip)
+  end
+
+  rules
+    .reject { |rule| INGORE_PORTS.include? rule.source_port }
+    .sort_by { |rule| rule.source_port.to_i }
+end
+
+def create_chains
+  log "Cleaning and creating chains..."
+
+  # We don't actually care about failures here
+  `iptables -t nat -N #{POLLER_OUTPUT_CHAIN} 2>&1`
+  `iptables -t nat -N #{POLLER_POSTROUTING_CHAIN} 2>&1`
+
+  # Flush if anything exist before
+  exec_safely "iptables -t nat -F #{POLLER_OUTPUT_CHAIN}"
+  exec_safely "iptables -t nat -F #{POLLER_POSTROUTING_CHAIN}"
+
+  # Reference to the OUTPUT/POSTROUTING chain
+  exec_safely "iptables -t nat -A OUTPUT -j #{POLLER_OUTPUT_CHAIN}"
+  exec_safely "iptables -t nat -A POSTROUTING -j #{POLLER_POSTROUTING_CHAIN}"
+end
+
+def flush_chains
+  debug "Flushing chains: #{POLLER_OUTPUT_CHAIN}, #{POLLER_POSTROUTING_CHAIN}"
+
+  exec_safely "iptables -t nat -F #{POLLER_OUTPUT_CHAIN}"
+  exec_safely "iptables -t nat -F #{POLLER_POSTROUTING_CHAIN}"
+end
+
+def update_rules(new_set)
+  flush_chains
+
+  # Maybe it's better to generate file and feed it to iptables at once with
+  # COMMIT command. This way some connections may fail while rules are updated.
+
+  new_set.each do |rule|
+    out_rule = sprintf(POLLER_OUTPUT, rule.to_h)
+    post_rule = sprintf(POLLER_POSTROUTING, rule.to_h)
+
+    exec_safely "iptables -t nat -A #{POLLER_OUTPUT_CHAIN} #{out_rule}"
+    exec_safely "iptables -t nat -A #{POLLER_POSTROUTING_CHAIN} #{post_rule}"
+  end
+
+  log "iptables chains updated"
+rescue ExecFailed => failure
+  log "Can't set iptables rules. Tried #{failure.command}, failed with: "
+  puts failure.output
+
+  exit 4
+end
+
+log "Starting Rancher iptables poller..."
+
+get_host_ip
+
+check_cattle
+check_sysctl
+
+create_chains
+
+@last_set = []
+@running = true
+@delay = 1.0
+
+log "Started with polling #{@delay}s delay"
+
+trap_callback = proc do
+  puts
+  log "Stopping ..."
+  @running = false
+end
+
+Signal.trap("INT", &trap_callback)
+Signal.trap("TERM", &trap_callback)
+
+while @running
+  current_set = cattle_prerouting
+
+  if current_set != @last_set
+    log "Chain changed:"
+    log "\tBefore: [#{@last_set.join(', ')}]"
+    log "\t After: [#{current_set.join(', ')}]"
+
+    update_rules current_set
+
+    @last_set = current_set
+  end
+
+  sleep @delay
+end
+
+log "Exited."
