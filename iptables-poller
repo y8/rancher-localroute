@@ -10,7 +10,7 @@ SYSCTL_KEYS = {
 }.freeze
 
 # We can ignore rancher IPSec. Strings to avoid type casting
-INGORE_PORTS = ['500', '4500']
+INGORE_PORTS = %w(500 4500)
 
 CATTLE_CHAIN = 'CATTLE_PREROUTING'
 CATTLE_CHAIN_COMMAND = "iptables -t nat -S #{CATTLE_CHAIN}"
@@ -18,8 +18,8 @@ CATTLE_CHAIN_COMMAND = "iptables -t nat -S #{CATTLE_CHAIN}"
 POLLER_OUTPUT_CHAIN = 'POLLER_OUTPUT'
 POLLER_POSTROUTING_CHAIN = 'POLLER_POSTROUTING'
 
-POLLER_OUTPUT = "-d %{host_ip} -p %{proto} --dport %{source_port} -j DNAT --to %{dest_address}:%{dest_port}"
-POLLER_POSTROUTING = "-d %{dest_address} -p %{proto} --dport %{dest_port} -j SNAT --to-source %{host_ip}"
+POLLER_OUTPUT = '-d %{host_ip} -p %{proto} --dport %{source_port} -j DNAT --to %{dest_address}:%{dest_port}'
+POLLER_POSTROUTING = '-d %{dest_address} -p %{proto} --dport %{dest_port} -j SNAT --to-source %{host_ip}'
 
 # Exception to be raised when system call failed.
 class ExecFailed < RuntimeError
@@ -37,19 +37,20 @@ class ExecFailed < RuntimeError
   alias_method :to_s, :inspect
 end
 
-# Instead of regexp, lets try with optparse
+# :nodoc:
 module IPTables
+  # Instead of regexp, lets try with optparse
   class DNAT
-    Rule = Struct.new(:proto, :source_port, :dest_address, :dest_port, :host_ip) do
-      # <# tcp://500 -> 10.0.1.1:466>
+    # Parsed iptables rule
+    Rule = Struct.new(:proto, :source_port, :dest_address, :dest_port) do
+      # <# tcp://:500 -> 10.0.1.1:466>
       def to_s
-        "<#{proto}: #{host_ip}:#{source_port} -> #{dest_address}:#{dest_port}>"
+        "<#{proto}://:#{source_port} -> #{dest_address}:#{dest_port}>"
       end
     end
 
-    def self.parse(options, host_ip)
+    def self.parse(options)
       rule = Rule.new
-      rule.host_ip = host_ip
 
       opt_parser = OptionParser.new do |opts|
         opts.on('-A ADD_CHAIN')
@@ -63,13 +64,13 @@ module IPTables
         end
         opts.on('-j JUMP_CHAIN')
         opts.on('--to-destination ADDR') do |dest|
-          rule.dest_address, rule.dest_port = dest.split(":")
+          rule.dest_address, rule.dest_port = dest.split(':')
         end
       end
 
       opt_parser.parse!(options.split)
 
-      return rule
+      rule
     end
   end
 end
@@ -84,37 +85,75 @@ end
 
 def exec_safely(command)
   output = `#{command} 2>&1`
-  exit_status = $?.exitstatus
+  exit_status = $CHILD_STATUS.exitstatus
 
   if exit_status != 0
-    raise ExecFailed.new(command, exit_status, output)
+    fail ExecFailed.new(command, exit_status, output)
   else
     return output
   end
 end
 
-def get_host_ip
-  return @host_ip if defined? @host_ip
+# Return current list of IPv4 addresses attachet to the host
+def host_ips
+  return host_ips_from_env if host_ips_from_env.any?
+  host_ips_from_iface(main_iface)
+end
 
-  # Drop the loopback ips
-  all_addresses =  Socket.ip_address_list.reject {|a| a.ipv4_loopback? || a.ipv6_loopback? }
+# Return the array of the hosts, if any set by 'POLLER_HOST_IP'
+def host_ips_from_env
+  @env_host_ips ||= ENV.fetch('POLLER_HOST_IP', '').split(/\s*,\s*/)
+end
 
-  # Try to find the ip4 address
-  ipv4s = all_addresses.find_all(&:ipv4?).map(&:ip_address)
-  ipv6s = all_addresses.find_all(&:ipv6?).map(&:ip_address)
+# Return array of IPv4 addresses on the
+def host_ips_from_iface(iface_name)
+  ipv4_ifaddrs.find_all { |iface| iface.name = iface_name }
+end
 
-  host_address = ipv4s.shift
+# Returns the name of the currenly selected interface
+def main_iface
+  @main_iface ||= ENV.fetch('POLLER_IFACE', first_interface_name)
+end
 
-  # Technically, we have more chances with IPv6 when available, but don't have
-  # time to implement v6 look up;)
+# Returns the name of the first interface with non-loopback IPv4 address
+def first_interface_name
+  @first_interface_name ||= ipv4_ifaddrs.map(&:name).uniq.first
+end
 
-  if host_address
-    log "\tDone. Using #{host_address} as return address (other options: #{ipv4s.join(', ')})"
+def ipv4_ifaddrs
+  Socket.getifaddrs.find_all do |iface|
+    addr = iface.addr
+    addr.ipv4? && !addr.ipv4_loopback?
+  end
+end
 
-    @host_ip = host_address
+# Check that we got at least one address.
+def check_host_ip
+  if host_ips.empty?
+    log "Can't detect IPv4 addresses on #{first_interface_name}."
+
+    log <<-ERROR
+
+    Set `POLLER_HOST_IP` enviroment variable to explicitly specify host IP
+    addresses. Multiple addresses can be specified and separated by comma
+    For example:
+
+        POLLER_HOST_IP= "10.0.0.1, 10.0.0.2"
+
+    Set `POLLER_IFACE` enviroment variable to specify the specific interface,
+    where IP addresses should be detected.
+
+    Note: IPv6 and loopback IP's are ignored.
+
+    ERROR
+
+    exit 1
+  end
+
+  if host_ips_from_env.any?
+    log "Running with IP from POLLER_HOST_IP: #{host_ips}"
   else
-    log "Can't detect host address. Set 'HOST_IP' to explicitly set IP."
-    exit 3
+    log "Running with IP from #{main_iface}: #{host_ips}"
   end
 end
 
@@ -146,7 +185,6 @@ def check_sysctl
 end
 
 def raw_cattle_prerouting
-
   exec_safely CATTLE_CHAIN_COMMAND
 
 rescue ExecFailed => failure
@@ -161,7 +199,7 @@ end
 
 def cattle_prerouting
   lines = raw_cattle_prerouting.split("\n")
-  chain_name = lines.shift.split.last
+  _chain_name = lines.shift.split.last
 
   # It will fail on unknown options, but let it fail.
   rules = lines.map do |rule|
@@ -169,12 +207,13 @@ def cattle_prerouting
   end
 
   rules
-    .reject { |rule| INGORE_PORTS.include? rule.source_port }
-    .sort_by { |rule| rule.source_port.to_i }
+  .map(&:source_port)
+    .reject { |source_port| INGORE_PORTS.include? source_port }
+    .sort_by { |rule| source_port.to_i }
 end
 
 def create_chains
-  log "Cleaning and creating chains..."
+  log 'Cleaning and creating chains...'
 
   # We don't actually care about failures here
   `iptables -t nat -N #{POLLER_OUTPUT_CHAIN} 2>&1`
@@ -202,15 +241,19 @@ def update_rules(new_set)
   # Maybe it's better to generate file and feed it to iptables at once with
   # COMMIT command. This way some connections may fail while rules are updated.
 
-  new_set.each do |rule|
-    out_rule = sprintf(POLLER_OUTPUT, rule.to_h)
-    post_rule = sprintf(POLLER_POSTROUTING, rule.to_h)
+  host_ips.each do |host_ip|
+    new_set.each do |rule|
+      rule = rule.to_h.merge host_ip: host_ip
 
-    exec_safely "iptables -t nat -A #{POLLER_OUTPUT_CHAIN} #{out_rule}"
-    exec_safely "iptables -t nat -A #{POLLER_POSTROUTING_CHAIN} #{post_rule}"
+      out_rule = format(POLLER_OUTPUT, rule)
+      post_rule = format(POLLER_POSTROUTING, rule)
+
+      exec_safely "iptables -t nat -A #{POLLER_OUTPUT_CHAIN} #{out_rule}"
+      exec_safely "iptables -t nat -A #{POLLER_POSTROUTING_CHAIN} #{post_rule}"
+    end
   end
 
-  log "iptables chains updated"
+  log 'iptables chain updated'
 rescue ExecFailed => failure
   log "Can't set iptables rules. Tried #{failure.command}, failed with: "
   puts failure.output
@@ -218,9 +261,9 @@ rescue ExecFailed => failure
   exit 4
 end
 
-log "Starting Rancher iptables poller..."
+log 'Starting Rancher iptables poller...'
 
-get_host_ip
+check_host_ip
 
 check_cattle
 check_sysctl
@@ -228,6 +271,7 @@ check_sysctl
 create_chains
 
 @last_set = []
+@last_ips = host_ips
 @running = true
 @delay = 1.0
 
@@ -235,18 +279,18 @@ log "Started with polling #{@delay}s delay"
 
 trap_callback = proc do
   puts
-  log "Stopping ..."
+  log 'Stopping ...'
   @running = false
 end
 
-Signal.trap("INT", &trap_callback)
-Signal.trap("TERM", &trap_callback)
+Signal.trap('INT', &trap_callback)
+Signal.trap('TERM', &trap_callback)
 
 while @running
   current_set = cattle_prerouting
 
   if current_set != @last_set
-    log "Chain changed:"
+    log 'Chain changed:'
     log "\tBefore: [#{@last_set.join(', ')}]"
     log "\t After: [#{current_set.join(', ')}]"
 
@@ -255,7 +299,17 @@ while @running
     @last_set = current_set
   end
 
+  if host_ips != @last_ips
+    log 'IPs changed:'
+    log "\tBefore: [#{@last_ips.join(', ')}]"
+    log "\t After: [#{host_ips.join(', ')}]"
+
+    update_rules current_set
+
+    @last_ips = host_ips
+  end
+
   sleep @delay
 end
 
-log "Exited."
+log 'Exited.'
