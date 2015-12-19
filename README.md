@@ -41,5 +41,19 @@ You can deploy this container with Rancher:
 
 Repeat for all environments.
 
+There two configuration environment variables available:
+
+  * `POLLER_HOST_IP` to explicitly set the host IP addresses. You can set
+     multiple addresses by separating them with comma, like `10.0.1.1, 10.0.1.2`
+  * `POLLER_IFACE` to set the interface name, like `eth0` where IP addresses
+     will be auto-detected. If new IP address is added or removed from the
+     given interface routing chain will change as well. Addresses with
+     `IFF_LOOPBACK` flag will be ignored.
+
+If no environment variables set first interface with non loopback IPv4 will be
+used.
+
+`rancher-localroute` works only with IPv4 and doesn't support IPv6 at all.
+
 This is very quick and dirty fix, so keep an eye on the logs. And check for
 the rancher-server issues for updates.
