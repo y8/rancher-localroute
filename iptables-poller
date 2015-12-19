@@ -107,7 +107,7 @@ end
 
 # Return array of IPv4 addresses on the
 def host_ips_from_iface(iface_name)
-  ipv4_ifaddrs.find_all { |iface| iface.name = iface_name }
+  ipv4_ifaddrs.find_all { |iface| iface.name == iface_name }
 end
 
 # Returns the name of the currenly selected interface
