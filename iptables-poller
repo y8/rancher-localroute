@@ -131,6 +131,7 @@ end
 
 # Check that we got at least one address.
 def check_host_ip
+  log "Detecting host IP addresses to attach chain rules..."
   if host_ips.empty?
     log "Can't detect IPv4 addresses on #{first_interface_name}."
 
@@ -153,9 +154,9 @@ def check_host_ip
   end
 
   if host_ips_from_env.any?
-    log "Running with IP from POLLER_HOST_IP: #{host_ips.join(", ")}"
+    log "\tUsing POLLER_HOST_IP: #{host_ips.join(", ")}"
   else
-    log "Running with IP from '#{main_iface}': #{host_ips.join(", ")}"
+    log "\tUsing '#{main_iface}': #{host_ips.join(", ")}"
   end
 end
 
