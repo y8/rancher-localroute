@@ -209,7 +209,7 @@ def cattle_prerouting
   end
 
   rules
-    .reject { |rule| INGORE_PORTS.include? rule.source_port.port }
+    .reject { |rule| INGORE_PORTS.include? rule.source_port }
     .sort_by { |rule| rule.source_port.to_i }
 end
 
