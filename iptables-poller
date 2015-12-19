@@ -153,9 +153,9 @@ def check_host_ip
   end
 
   if host_ips_from_env.any?
-    log "Running with IP from POLLER_HOST_IP: #{host_ips}"
+    log "Running with IP from POLLER_HOST_IP: #{host_ips.join(", ")}"
   else
-    log "Running with IP from #{main_iface}: #{host_ips}"
+    log "Running with IP from '#{main_iface}': #{host_ips.join(", ")}"
   end
 end
 
