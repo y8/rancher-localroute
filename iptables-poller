@@ -209,9 +209,8 @@ def cattle_prerouting
   end
 
   rules
-  .map(&:source_port)
-    .reject { |port| INGORE_PORTS.include? port }
-    .sort_by { |port| port.to_i }
+    .reject { |rule| INGORE_PORTS.include? rule.source_port.port }
+    .sort_by { |rule| rule.source_port.to_i }
 end
 
 def create_chains
