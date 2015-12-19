@@ -205,7 +205,7 @@ def cattle_prerouting
 
   # It will fail on unknown options, but let it fail.
   rules = lines.map do |rule|
-    IPTables::DNAT.parse(rule, get_host_ip)
+    IPTables::DNAT.parse(rule)
   end
 
   rules
