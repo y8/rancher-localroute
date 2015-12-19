@@ -22,6 +22,8 @@ POLLER_POSTROUTING_CHAIN = 'POLLER_POSTROUTING'
 POLLER_OUTPUT = '-d %{host_ip} -p %{proto} --dport %{source_port} -j DNAT --to %{dest_address}:%{dest_port}'
 POLLER_POSTROUTING = '-d %{dest_address} -p %{proto} --dport %{dest_port} -j SNAT --to-source %{host_ip}'
 
+POLLER_VERSION = '0.2.0'
+
 # Exception to be raised when system call failed.
 class ExecFailed < RuntimeError
   attr_reader :command, :exit_code, :output
@@ -263,7 +265,7 @@ rescue ExecFailed => failure
   exit 4
 end
 
-log 'Starting Rancher iptables poller...'
+log "Starting Rancher iptables poller #{POLLER_VERSION}..."
 
 check_host_ip
 
