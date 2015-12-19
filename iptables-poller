@@ -2,6 +2,7 @@
 
 require 'socket'
 require 'optparse'
+require 'English'
 
 # We need IP forwarding and local routing to make this work
 SYSCTL_KEYS = {
@@ -20,6 +21,8 @@ POLLER_POSTROUTING_CHAIN = 'POLLER_POSTROUTING'
 
 POLLER_OUTPUT = '-d %{host_ip} -p %{proto} --dport %{source_port} -j DNAT --to %{dest_address}:%{dest_port}'
 POLLER_POSTROUTING = '-d %{dest_address} -p %{proto} --dport %{dest_port} -j SNAT --to-source %{host_ip}'
+
+POLLER_VERSION = '0.2.0'
 
 # Exception to be raised when system call failed.
 class ExecFailed < RuntimeError
@@ -107,7 +110,8 @@ end
 
 # Return array of IPv4 addresses on the
 def host_ips_from_iface(iface_name)
-  ipv4_ifaddrs.find_all { |iface| iface.name = iface_name }
+  ipv4_ifaddrs.find_all { |iface| iface.name == iface_name }
+    .map {|iface| iface.addr.ip_address }
 end
 
 # Returns the name of the currenly selected interface
@@ -129,6 +133,7 @@ end
 
 # Check that we got at least one address.
 def check_host_ip
+  log "Detecting host IP addresses to attach chain rules..."
   if host_ips.empty?
     log "Can't detect IPv4 addresses on #{first_interface_name}."
 
@@ -151,9 +156,9 @@ def check_host_ip
   end
 
   if host_ips_from_env.any?
-    log "Running with IP from POLLER_HOST_IP: #{host_ips}"
+    log "\tUsing POLLER_HOST_IP: #{host_ips.join(", ")}"
   else
-    log "Running with IP from #{main_iface}: #{host_ips}"
+    log "\tUsing '#{main_iface}': #{host_ips.join(", ")}"
   end
 end
 
@@ -203,13 +208,12 @@ def cattle_prerouting
 
   # It will fail on unknown options, but let it fail.
   rules = lines.map do |rule|
-    IPTables::DNAT.parse(rule, get_host_ip)
+    IPTables::DNAT.parse(rule)
   end
 
   rules
-  .map(&:source_port)
-    .reject { |source_port| INGORE_PORTS.include? source_port }
-    .sort_by { |rule| source_port.to_i }
+    .reject { |rule| INGORE_PORTS.include? rule.source_port }
+    .sort_by { |rule| rule.source_port.to_i }
 end
 
 def create_chains
@@ -261,7 +265,7 @@ rescue ExecFailed => failure
   exit 4
 end
 
-log 'Starting Rancher iptables poller...'
+log "Starting Rancher iptables poller #{POLLER_VERSION}..."
 
 check_host_ip
 
