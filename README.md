@@ -1,3 +1,5 @@
+⛔️ This fix it not relevant anymore, repository kept for historical purposes 
+
 # Rancher local routing fix
 
 [![](https://badge.imagelayers.io/yopp/rancher-localroute:latest.svg)](https://imagelayers.io/?images=yopp/rancher-localroute:latest 'Get your own badge on imagelayers.io')
